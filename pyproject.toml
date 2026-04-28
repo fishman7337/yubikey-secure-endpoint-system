@@ -1,0 +1,17 @@
+[tool.black]
+line-length = 88
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "D"]
+ignore = [
+    "D100",
+    "D104",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"

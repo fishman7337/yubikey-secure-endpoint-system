@@ -1,0 +1,13 @@
+{
+  "name": "yubiwatch-e2e",
+  "version": "1.0.0",
+  "private": true,
+  "description": "End-to-end dashboard tests for YubiWatch.",
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.57.0"
+  }
+}
