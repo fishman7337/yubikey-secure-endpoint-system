@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::AppConfig;
 use crate::detector::DeviceDetector;
+use crate::diagnostics::{Diagnostic, RuntimeDiagnostics, lock_fix_steps, scanner_fix_steps};
 use crate::locker::Locker;
 use crate::security::{GuardDecision, SecurityGate};
 
@@ -28,6 +29,7 @@ pub struct Watchdog<D, L> {
     security_gate: SecurityGate,
     state: WatchdogState,
     foreground: bool,
+    diagnostics: Option<RuntimeDiagnostics>,
 }
 
 impl<D, L> Watchdog<D, L>
@@ -50,7 +52,14 @@ where
             security_gate,
             state: WatchdogState::default(),
             foreground,
+            diagnostics: None,
         }
+    }
+
+    /// Adds a shared diagnostics sink for dashboard-visible runtime failures.
+    pub fn with_diagnostics(mut self, diagnostics: RuntimeDiagnostics) -> Self {
+        self.diagnostics = Some(diagnostics);
+        self
     }
 
     /// Runs the watchdog forever.
@@ -122,9 +131,22 @@ where
 
     fn detect_present(&mut self) -> bool {
         match self.detector.is_connected() {
-            Ok(present) => present,
+            Ok(present) => {
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.clear_category("scanner");
+                }
+                present
+            }
             Err(error) => {
                 self.log(&format!("USB detection failed: {error}"));
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.record(Diagnostic::new(
+                        "scanner",
+                        "Security-key scanner failed.",
+                        error,
+                        scanner_fix_steps(),
+                    ));
+                }
                 !self.config.fail_safe_lock
             }
         }
@@ -132,8 +154,23 @@ where
 
     fn lock_workstation(&mut self) {
         self.log("Security key absent. Locking workstation.");
-        if let Err(error) = self.locker.lock() {
-            self.log(&format!("Failed to lock workstation: {error}"));
+        match self.locker.lock() {
+            Ok(()) => {
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.clear_category("lock");
+                }
+            }
+            Err(error) => {
+                self.log(&format!("Failed to lock workstation: {error}"));
+                if let Some(diagnostics) = &self.diagnostics {
+                    diagnostics.record(Diagnostic::new(
+                        "lock",
+                        "Windows lock request failed.",
+                        error,
+                        lock_fix_steps(),
+                    ));
+                }
+            }
         }
     }
 

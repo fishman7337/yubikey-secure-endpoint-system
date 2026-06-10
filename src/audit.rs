@@ -30,15 +30,38 @@ impl AuditLog {
 
     /// Records one structured event.
     pub fn record(&self, category: &str, action: &str, outcome: &str, details: &str) {
-        if let Err(error) = self.try_record(category, action, outcome, details) {
+        if let Err(error) = self.record_result(category, action, outcome, details) {
             eprintln!("audit log write failed: {error}");
         }
     }
 
+    /// Records one structured event and returns write failures to the caller.
+    pub fn record_result(
+        &self,
+        category: &str,
+        action: &str,
+        outcome: &str,
+        details: &str,
+    ) -> Result<(), String> {
+        self.try_record(category, action, outcome, details)
+    }
+
     /// Returns recent raw JSON audit entries for dashboard embedding.
     pub fn recent_json_entries(&self, limit: usize) -> Vec<String> {
-        let Ok(contents) = fs::read_to_string(&self.path) else {
-            return Vec::new();
+        self.recent_json_entries_result(limit).unwrap_or_default()
+    }
+
+    /// Returns recent raw JSON audit entries and reports read failures.
+    pub fn recent_json_entries_result(&self, limit: usize) -> Result<Vec<String>, String> {
+        let contents = match fs::read_to_string(&self.path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(format!(
+                    "failed to read audit log {}: {error}",
+                    self.path.display()
+                ));
+            }
         };
 
         let mut lines = contents
@@ -48,7 +71,7 @@ impl AuditLog {
             .collect::<Vec<_>>();
         let keep_from = lines.len().saturating_sub(limit);
         lines.drain(0..keep_from);
-        lines
+        Ok(lines)
     }
 
     fn try_record(

@@ -395,7 +395,7 @@ fn module_status(
         ),
         _ => (
             "Preview".to_string(),
-            "This option is visible now, but deeper blocking needs a future service update."
+            "Preview display only; OS blocking needs a future Windows service or administrator policy backend."
                 .to_string(),
         ),
     }

@@ -16,6 +16,7 @@ The primary implementation is now the native Rust executable at `target\release\
 - No disk logs by default, so there is no unbounded file growth.
 - Localhost dashboard for turning protection on only when the key is inserted.
 - Native protection starts off unless `YUBIWATCH_ALWAYS_KEEP_ENABLED=true`.
+- Native single-instance guard prevents a second watchdog for the same `.env`.
 
 ## Current Defaults
 
@@ -27,7 +28,9 @@ The primary implementation is now the native Rust executable at `target\release\
 - Relock cooldown while absent: 5 seconds
 - Fail-safe mode: USB detector errors are treated as key absence
 - Startup policy: off until **Always On** is selected with the key and Security PIN
-- Startup dashboard: opens in the default browser after logon
+- Startup trigger: current-user logon only
+- Startup dashboard: the native watchdog opens it in the default browser after logon
+- Duplicate process policy: Task Scheduler ignores duplicate starts and the native mutex exits duplicate manual launches
 - Security PIN: required for protection changes, set once on first use
 - Protected Mode: modular hardening controller, off by default and protected by the PIN plus security key
 
@@ -43,10 +46,15 @@ Build and test the native executable:
 
 ```powershell
 cargo test
+python -m unittest discover -s tests -v
 npm run test:e2e
 cargo build --release
 .\target\release\yubiwatch.exe --env-file .\.env --check
 ```
+
+The Python fallback unit tests pass without installing PyUSB. Install
+`requirements.txt` only when running the Python fallback against real USB
+hardware, then run the same tests again if you are validating that path.
 
 Run without locking while you observe behavior:
 
@@ -63,8 +71,8 @@ http://127.0.0.1:8765/
 ```
 
 This laptop's `.env` also sets `YUBIWATCH_OPEN_DASHBOARD_ON_STARTUP=true`, so
-the login launcher opens the control panel in the default browser after the
-watchdog starts.
+the native watchdog opens the control panel in the default browser after it
+starts. The VBS launcher only starts the hidden watchdog process.
 
 The dashboard shows the centered classification banner
 `Official (Closed), Non-Sensitive.` and uses a dark command-panel theme with
@@ -86,10 +94,11 @@ The dashboard can also add another inserted Yubico product ID, but only while
 the original key is present. The new ID is added live and saved back to `.env`.
 
 The dashboard now includes **Protection Settings**. It shows protection
-modules, score, items needing attention, and recent activity. The security-key
-and laptop-session modules are active today; deeper USB, network, app, data,
-clipboard, and tamper modules are previews until a Windows service or admin
-policy backend is added.
+modules, score, items needing attention, and recent activity. The security-key,
+laptop-session, activity-history, and health modules are active today. Deeper
+USB allow-listing, network, app, file, clipboard, and tamper modules are preview
+or planned controls only until a Windows service or admin policy backend is
+added.
 
 This protects the supported disable path, but it is not magic. A Windows admin
 can still kill processes, unregister scheduled tasks, or edit files offline.
@@ -99,23 +108,29 @@ See `SECURITY.md` for the hard boundary and hardening notes.
 
 `start_watchdog.bat` now prefers the Rust executable:
 
-1. `.dist\yubiwatch-latest.exe`
-2. `.dist\yubiwatch.exe`
-3. `target\release\yubiwatch.exe`
-4. Python virtual environment fallback
-5. system Python fallback
+1. `.dist\yubiwatch-current.exe`
+2. `.dist\yubiwatch-latest.exe`
+3. `.dist\yubiwatch.exe`
+4. `target\release\yubiwatch.exe`
+5. Python virtual environment fallback
+6. system Python fallback
 
-Install or refresh the login scheduled task:
+Install or refresh the logon scheduled task:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_task.ps1
 ```
 
-On the next logon, Task Scheduler starts `watchdog_launcher.vbs`, which starts
-the watchdog and opens the local dashboard when
-`YUBIWATCH_OPEN_DASHBOARD_ON_STARTUP=true`.
+On the next user logon, Task Scheduler starts `watchdog_launcher.vbs`, which
+starts the watchdog through `start_watchdog.bat`. The task is logon-only: it
+does not register boot, unlock, or session-change triggers. It also uses
+`MultipleInstances IgnoreNew`, and the native executable has a per-`.env` mutex,
+so duplicate starts reuse the existing dashboard instead of launching another
+watchdog.
+
 If Windows denies scheduled-task registration, the installer falls back to a
-per-user Startup shortcut that runs the same launcher.
+per-user Startup shortcut that runs the same launcher. When scheduled-task
+registration succeeds, the installer removes that fallback shortcut.
 
 ## Documentation
 

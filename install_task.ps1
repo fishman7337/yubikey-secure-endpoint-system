@@ -29,10 +29,23 @@ function Install-StartupShortcut {
     $shortcut.Arguments = "`"$LauncherPath`""
     $shortcut.WorkingDirectory = $WorkingDirectory
     $shortcut.WindowStyle = 7
-    $shortcut.Description = "Start YubiWatch and open the local dashboard at logon."
+    $shortcut.Description = "Start YubiWatch at logon."
     $shortcut.Save()
 
     Write-Host "Installed startup shortcut '$shortcutPath'."
+}
+
+function Remove-StartupShortcut {
+    $startupFolder = [Environment]::GetFolderPath("Startup")
+    if ([string]::IsNullOrWhiteSpace($startupFolder)) {
+        return
+    }
+
+    $shortcutPath = Join-Path $startupFolder "YubiWatch.lnk"
+    if (Test-Path -LiteralPath $shortcutPath) {
+        Remove-Item -LiteralPath $shortcutPath -Force
+        Write-Host "Removed fallback startup shortcut '$shortcutPath'."
+    }
 }
 
 $action = New-ScheduledTaskAction `
@@ -48,6 +61,8 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Seconds 0)
 
 try {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
     Register-ScheduledTask `
         -TaskName $taskName `
         -Action $action `
@@ -56,6 +71,7 @@ try {
         -Description "Starts YubiWatch at logon, locks when the configured YubiKey is absent, and can open the local dashboard." `
         -Force | Out-Null
 
+    Remove-StartupShortcut
     Write-Host "Installed scheduled task '$taskName'."
 }
 catch {

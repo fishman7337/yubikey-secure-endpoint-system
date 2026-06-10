@@ -16,6 +16,7 @@ use std::{fs, path::Path};
 use crate::audit::AuditLog;
 use crate::config::AppConfig;
 use crate::detector::{NativeYubiKeyDetector, TrustedProducts, YubicoDevice, product_id_label};
+use crate::diagnostics::{Diagnostic, RuntimeDiagnostics, lock_fix_steps, scanner_fix_steps};
 use crate::locker::{Locker, WorkstationLocker};
 use crate::mode::{
     SecureModeController, SecureModeSnapshot, module_definitions, module_env_key,
@@ -38,6 +39,7 @@ struct DashboardContext {
     pin_authorization: PinAuthorization,
     mode_controller: SecureModeController,
     audit_log: AuditLog,
+    diagnostics: RuntimeDiagnostics,
     lock_actions_enabled: bool,
 }
 
@@ -114,6 +116,7 @@ pub fn spawn_dashboard(
     env_file: PathBuf,
     gate: SecurityGate,
     trusted_products: TrustedProducts,
+    diagnostics: RuntimeDiagnostics,
     lock_actions_enabled: bool,
 ) -> Result<thread::JoinHandle<()>, String> {
     let address = format!("127.0.0.1:{}", config.dashboard_port);
@@ -125,12 +128,6 @@ pub fn spawn_dashboard(
     let mode_controller =
         SecureModeController::new(config.secure_mode_enabled, &config.module_overrides);
     let audit_log = AuditLog::new(config.audit_log_file.clone(), config.audit_max_bytes);
-    audit_log.record(
-        "system",
-        "dashboard_started",
-        "allowed",
-        "Dashboard opened locally",
-    );
     let context = DashboardContext {
         config,
         env_file,
@@ -140,8 +137,16 @@ pub fn spawn_dashboard(
         pin_authorization,
         mode_controller,
         audit_log,
+        diagnostics,
         lock_actions_enabled,
     };
+    record_audit(
+        &context,
+        "system",
+        "dashboard_started",
+        "allowed",
+        "Dashboard opened locally",
+    );
 
     Ok(thread::spawn(move || {
         println!("YubiWatch dashboard: http://{address}/");
@@ -170,54 +175,55 @@ fn handle_connection(
     let request = read_request(&mut stream)?;
     let parsed = HttpRequest::parse(&request)?;
 
-    let response = match (parsed.method.as_str(), parsed.path.as_str()) {
-        ("GET", "/") => html_response(&dashboard_html(
-            &csrf_token,
-            &context.env_file,
-            &context.config,
-        )),
-        ("GET", "/api/status") => status_response(&context, None),
-        ("POST", "/api/pin/setup") => {
-            require_csrf(&parsed, &csrf_token)?;
-            setup_pin_response(&context, &parsed)
+    let csrf_error = if parsed.method == "POST" {
+        require_csrf(&parsed, &csrf_token).err()
+    } else {
+        None
+    };
+    if csrf_error.is_none() {
+        context.diagnostics.clear_category("dashboard");
+    }
+
+    let response = if let Some(error) = csrf_error {
+        diagnostic_response(
+            &context,
+            401,
+            "dashboard",
+            "Dashboard request was rejected.",
+            &error,
+            vec![
+                "Reload the dashboard page and try the action again.".to_string(),
+                "Use only the local http://127.0.0.1 dashboard tab served by YubiWatch."
+                    .to_string(),
+            ],
+        )
+    } else {
+        match (parsed.method.as_str(), parsed.path.as_str()) {
+            ("GET", "/") => html_response(&dashboard_html(
+                &csrf_token,
+                &context.env_file,
+                &context.config,
+            )),
+            ("GET", "/api/status") => status_response(&context, None),
+            ("POST", "/api/pin/setup") => setup_pin_response(&context, &parsed),
+            ("POST", "/api/pin/confirm") => confirm_pin_response(&context, &parsed),
+            ("POST", "/api/pin/reset") => reset_pin_response(&context, &parsed),
+            ("POST", "/api/secure-mode") => secure_mode_response(&context, &parsed),
+            ("POST", "/api/modules/toggle") => module_toggle_response(&context, &parsed),
+            ("POST", "/api/disable") => disable_response(&context, &parsed),
+            ("POST", "/api/disable/start") => disable_response(&context, &parsed),
+            ("POST", "/api/enable") => enable_response(&context, &parsed, false),
+            ("POST", "/api/enable/always") => enable_response(&context, &parsed, true),
+            ("POST", "/api/devices/add") => add_device_response(&context, &parsed),
+            _ => json_response(
+                404,
+                &diagnostic_error_json(
+                    "Dashboard endpoint was not found.",
+                    "The browser requested an unknown local YubiWatch path.",
+                    &["Reload the dashboard page and try again.".to_string()],
+                ),
+            ),
         }
-        ("POST", "/api/pin/confirm") => {
-            require_csrf(&parsed, &csrf_token)?;
-            confirm_pin_response(&context, &parsed)
-        }
-        ("POST", "/api/pin/reset") => {
-            require_csrf(&parsed, &csrf_token)?;
-            reset_pin_response(&context, &parsed)
-        }
-        ("POST", "/api/secure-mode") => {
-            require_csrf(&parsed, &csrf_token)?;
-            secure_mode_response(&context, &parsed)
-        }
-        ("POST", "/api/modules/toggle") => {
-            require_csrf(&parsed, &csrf_token)?;
-            module_toggle_response(&context, &parsed)
-        }
-        ("POST", "/api/disable") => {
-            require_csrf(&parsed, &csrf_token)?;
-            disable_response(&context, &parsed)
-        }
-        ("POST", "/api/disable/start") => {
-            require_csrf(&parsed, &csrf_token)?;
-            disable_response(&context, &parsed)
-        }
-        ("POST", "/api/enable") => {
-            require_csrf(&parsed, &csrf_token)?;
-            enable_response(&context, &parsed, false)
-        }
-        ("POST", "/api/enable/always") => {
-            require_csrf(&parsed, &csrf_token)?;
-            enable_response(&context, &parsed, true)
-        }
-        ("POST", "/api/devices/add") => {
-            require_csrf(&parsed, &csrf_token)?;
-            add_device_response(&context, &parsed)
-        }
-        _ => plain_response(404, "Not found"),
     };
 
     stream
@@ -246,7 +252,14 @@ fn status_response(context: &DashboardContext, message: Option<&str>) -> String 
 fn setup_pin_response(context: &DashboardContext, request: &HttpRequest) -> String {
     let status = dashboard_status(context, None);
     if let Some(error) = status.error {
-        return json_response(503, &error_json(&error));
+        return diagnostic_response(
+            context,
+            503,
+            "scanner",
+            "Security-key scanner failed.",
+            &error,
+            scanner_fix_steps(),
+        );
     }
 
     if !status.key_present {
@@ -265,9 +278,13 @@ fn setup_pin_response(context: &DashboardContext, request: &HttpRequest) -> Stri
 
     match context.pin_gate.setup(&pin, &confirm_pin) {
         Ok(()) => {
-            context
-                .audit_log
-                .record("identity", "pin_setup", "allowed", "Security PIN created");
+            record_audit(
+                context,
+                "identity",
+                "pin_setup",
+                "allowed",
+                "Security PIN created",
+            );
             status_response(
                 context,
                 Some("Security PIN created. Protection controls now require your key and PIN."),
@@ -280,7 +297,14 @@ fn setup_pin_response(context: &DashboardContext, request: &HttpRequest) -> Stri
 fn confirm_pin_response(context: &DashboardContext, request: &HttpRequest) -> String {
     let status = dashboard_status(context, None);
     if let Some(error) = status.error {
-        return json_response(503, &error_json(&error));
+        return diagnostic_response(
+            context,
+            503,
+            "scanner",
+            "Security-key scanner failed.",
+            &error,
+            scanner_fix_steps(),
+        );
     }
 
     if !status.key_present {
@@ -303,7 +327,8 @@ fn confirm_pin_response(context: &DashboardContext, request: &HttpRequest) -> St
     match context.pin_gate.verify(&pin) {
         Ok(()) => {
             let token = context.pin_authorization.issue();
-            context.audit_log.record(
+            record_audit(
+                context,
                 "identity",
                 "pin_confirm",
                 "allowed",
@@ -320,7 +345,8 @@ fn confirm_pin_response(context: &DashboardContext, request: &HttpRequest) -> St
         }
         Err(error) => {
             let should_lock = context.pin_authorization.record_failure();
-            context.audit_log.record(
+            record_audit(
+                context,
                 "identity",
                 "pin_confirm",
                 "blocked",
@@ -339,7 +365,14 @@ fn confirm_pin_response(context: &DashboardContext, request: &HttpRequest) -> St
                             "Incorrect Security PIN. Laptop locked after 3 failed attempts.",
                         ),
                     ),
-                    Err(lock_error) => json_response(503, &error_json(&lock_error)),
+                    Err(lock_error) => diagnostic_response(
+                        context,
+                        503,
+                        "lock",
+                        "Windows lock request failed.",
+                        &lock_error,
+                        lock_fix_steps(),
+                    ),
                 }
             } else {
                 json_response(401, &error_json(&error))
@@ -351,7 +384,14 @@ fn confirm_pin_response(context: &DashboardContext, request: &HttpRequest) -> St
 fn reset_pin_response(context: &DashboardContext, request: &HttpRequest) -> String {
     let status = dashboard_status(context, None);
     if let Some(error) = status.error {
-        return json_response(503, &error_json(&error));
+        return diagnostic_response(
+            context,
+            503,
+            "scanner",
+            "Security-key scanner failed.",
+            &error,
+            scanner_fix_steps(),
+        );
     }
 
     if !status.key_present {
@@ -370,19 +410,44 @@ fn reset_pin_response(context: &DashboardContext, request: &HttpRequest) -> Stri
     }
 
     if let Err(error) = WorkstationLocker::new(context.lock_actions_enabled).lock() {
-        return json_response(503, &error_json(&error));
+        return diagnostic_response(
+            context,
+            503,
+            "lock",
+            "Windows lock request failed.",
+            &error,
+            lock_fix_steps(),
+        );
     }
-    context.gate.disable();
     if let Err(error) = persist_guard_startup(&context.env_file, false) {
-        return json_response(503, &error_json(&error));
+        return diagnostic_response(
+            context,
+            503,
+            "persistence",
+            "Startup protection setting could not be saved.",
+            &error,
+            persistence_fix_steps(&context.env_file),
+        );
+    }
+    if let Err(error) = persist_secure_mode(&context.env_file, false) {
+        return diagnostic_response(
+            context,
+            503,
+            "persistence",
+            "Protected Mode setting could not be saved.",
+            &error,
+            persistence_fix_steps(&context.env_file),
+        );
     }
     if let Err(error) = context.pin_gate.clear_after_lock() {
         return json_response(503, &error_json(&error));
     }
+    context.gate.disable();
     context.pin_authorization.clear();
     context.mode_controller.set_secure_mode(false);
-    let _ = persist_secure_mode(&context.env_file, false);
-    context.audit_log.record(
+    context.diagnostics.clear_category("persistence");
+    record_audit(
+        context,
         "identity",
         "pin_reset",
         "allowed",
@@ -406,21 +471,39 @@ fn secure_mode_response(context: &DashboardContext, request: &HttpRequest) -> St
         return response;
     }
 
-    context.mode_controller.set_secure_mode(enabled);
-    if let Err(error) = persist_secure_mode(&context.env_file, enabled) {
-        return json_response(503, &error_json(&error));
+    let persist_result = if enabled {
+        persist_secure_mode(&context.env_file, true)
+    } else {
+        persist_env_values(
+            &context.env_file,
+            &[
+                ("YUBIWATCH_SECURE_MODE_ENABLED", "false"),
+                ("YUBIWATCH_ALWAYS_KEEP_ENABLED", "false"),
+                ("YUBIWATCH_LOCK_ENABLED", "false"),
+            ],
+        )
+    };
+    if let Err(error) = persist_result {
+        return diagnostic_response(
+            context,
+            503,
+            "persistence",
+            "Protected Mode setting could not be saved.",
+            &error,
+            persistence_fix_steps(&context.env_file),
+        );
     }
+    context.diagnostics.clear_category("persistence");
 
+    context.mode_controller.set_secure_mode(enabled);
     if enabled && context.mode_controller.module_enabled("identity_access") {
         context.gate.enable();
     } else if !enabled {
         context.gate.disable();
-        if let Err(error) = persist_guard_startup(&context.env_file, false) {
-            return json_response(503, &error_json(&error));
-        }
     }
 
-    context.audit_log.record(
+    record_audit(
+        context,
         "policy",
         "secure_mode",
         "allowed",
@@ -457,23 +540,41 @@ fn module_toggle_response(context: &DashboardContext, request: &HttpRequest) -> 
         return response;
     }
 
+    let key = module_env_key(&module_id);
+    let value = if enabled { "true" } else { "false" };
+    let persist_result = if module_id == "identity_access" && !enabled {
+        persist_env_values(
+            &context.env_file,
+            &[
+                (&key, value),
+                ("YUBIWATCH_ALWAYS_KEEP_ENABLED", "false"),
+                ("YUBIWATCH_LOCK_ENABLED", "false"),
+            ],
+        )
+    } else {
+        persist_env_values(&context.env_file, &[(&key, value)])
+    };
+    if let Err(error) = persist_result {
+        return diagnostic_response(
+            context,
+            503,
+            "persistence",
+            "Protection setting could not be saved.",
+            &error,
+            persistence_fix_steps(&context.env_file),
+        );
+    }
+    context.diagnostics.clear_category("persistence");
+
     if let Err(error) = context
         .mode_controller
         .set_module_enabled(&module_id, enabled)
     {
         return json_response(400, &error_json(&error));
     }
-    let key = module_env_key(&module_id);
-    let value = if enabled { "true" } else { "false" };
-    if let Err(error) = persist_env_values(&context.env_file, &[(&key, value)]) {
-        return json_response(503, &error_json(&error));
-    }
 
     if module_id == "identity_access" && !enabled {
         context.gate.disable();
-        if let Err(error) = persist_guard_startup(&context.env_file, false) {
-            return json_response(503, &error_json(&error));
-        }
     } else if module_id == "identity_access" && enabled {
         let secure_snapshot = context.mode_controller.snapshot(
             context.gate.snapshot().enabled,
@@ -494,14 +595,16 @@ fn module_toggle_response(context: &DashboardContext, request: &HttpRequest) -> 
             ""
         }
     );
-    context
-        .audit_log
-        .record("policy", "module_toggle", "allowed", &detail);
+    record_audit(context, "policy", "module_toggle", "allowed", &detail);
 
-    status_response(
-        context,
-        Some(&format!("Protection setting updated: {detail}.")),
-    )
+    let message = if enabled && !module_implemented(&module_id) {
+        format!(
+            "Protection setting updated: {detail}. Preview display enabled only; no OS blocking is active. To enforce this, install a future Windows service or administrator policy backend."
+        )
+    } else {
+        format!("Protection setting updated: {detail}.")
+    };
+    status_response(context, Some(&message))
 }
 
 fn enable_response(
@@ -514,11 +617,20 @@ fn enable_response(
     }
 
     if persist_startup && let Err(error) = persist_guard_startup(&context.env_file, true) {
-        return json_response(503, &error_json(&error));
+        return diagnostic_response(
+            context,
+            503,
+            "persistence",
+            "Startup protection setting could not be saved.",
+            &error,
+            persistence_fix_steps(&context.env_file),
+        );
     }
+    context.diagnostics.clear_category("persistence");
 
     context.gate.enable();
-    context.audit_log.record(
+    record_audit(
+        context,
         "identity",
         "protection_on",
         "allowed",
@@ -543,28 +655,38 @@ fn disable_response(context: &DashboardContext, request: &HttpRequest) -> String
         return response;
     }
 
+    if let Err(error) = persist_env_values(
+        &context.env_file,
+        &[
+            ("YUBIWATCH_ALWAYS_KEEP_ENABLED", "false"),
+            ("YUBIWATCH_LOCK_ENABLED", "false"),
+            ("YUBIWATCH_SECURE_MODE_ENABLED", "false"),
+        ],
+    ) {
+        return diagnostic_response(
+            context,
+            503,
+            "persistence",
+            "Protection setting could not be saved.",
+            &error,
+            persistence_fix_steps(&context.env_file),
+        );
+    }
+    context.diagnostics.clear_category("persistence");
+
     context.gate.disable();
     context.mode_controller.set_secure_mode(false);
 
-    let message = match persist_guard_startup(&context.env_file, false) {
-        Ok(()) => "Protection is off and will stay off at startup.".to_string(),
-        Err(error) => {
-            format!(
-                "Protection is off for this session, but the startup setting was not saved: {error}"
-            )
-        }
-    };
-    if let Err(error) = persist_secure_mode(&context.env_file, false) {
-        return json_response(503, &error_json(&error));
-    }
-    context.audit_log.record(
+    let message = "Protection is off and will stay off at startup.";
+    record_audit(
+        context,
         "identity",
         "protection_off",
         "allowed",
         "Protection and Protected Mode turned off",
     );
 
-    status_response(context, Some(&message))
+    status_response(context, Some(message))
 }
 
 fn add_device_response(context: &DashboardContext, request: &HttpRequest) -> String {
@@ -574,7 +696,14 @@ fn add_device_response(context: &DashboardContext, request: &HttpRequest) -> Str
 
     let status = dashboard_status(context, None);
     if let Some(error) = status.error {
-        return json_response(503, &error_json(&error));
+        return diagnostic_response(
+            context,
+            503,
+            "scanner",
+            "Security-key scanner failed.",
+            &error,
+            scanner_fix_steps(),
+        );
     }
 
     if !status.original_present {
@@ -602,11 +731,20 @@ fn add_device_response(context: &DashboardContext, request: &HttpRequest) -> Str
     let mut updated = context.trusted_products.product_ids();
     updated.push(product_id);
     if let Err(error) = persist_product_ids(&context.env_file, &updated) {
-        return json_response(503, &error_json(&error));
+        return diagnostic_response(
+            context,
+            503,
+            "persistence",
+            "Trusted security-key list could not be saved.",
+            &error,
+            persistence_fix_steps(&context.env_file),
+        );
     }
+    context.diagnostics.clear_category("persistence");
 
     context.trusted_products.replace(updated);
-    context.audit_log.record(
+    record_audit(
+        context,
         "device",
         "device_trusted",
         "allowed",
@@ -623,6 +761,65 @@ fn module_display_name(module_id: &str) -> String {
         .unwrap_or_else(|| module_id.replace('_', " "))
 }
 
+fn record_audit(
+    context: &DashboardContext,
+    category: &str,
+    action: &str,
+    outcome: &str,
+    details: &str,
+) {
+    match context
+        .audit_log
+        .record_result(category, action, outcome, details)
+    {
+        Ok(()) => context.diagnostics.clear_category("audit"),
+        Err(error) => record_diagnostic(
+            context,
+            Diagnostic::new(
+                "audit",
+                "Activity history could not be saved.",
+                error,
+                audit_fix_steps(&context.config.audit_log_file),
+            ),
+        ),
+    }
+}
+
+fn record_diagnostic(context: &DashboardContext, diagnostic: Diagnostic) {
+    context.diagnostics.record(diagnostic);
+}
+
+fn diagnostic_response(
+    context: &DashboardContext,
+    status: u16,
+    category: &str,
+    summary: &str,
+    cause: &str,
+    fix_steps: Vec<String>,
+) -> String {
+    record_diagnostic(
+        context,
+        Diagnostic::new(category, summary, cause, fix_steps.clone()),
+    );
+    json_response(status, &diagnostic_error_json(summary, cause, &fix_steps))
+}
+
+fn persistence_fix_steps(env_file: &Path) -> Vec<String> {
+    vec![
+        format!("Check that {} exists and is writable.", env_file.display()),
+        "Close editors or security tools that may be locking the file.".to_string(),
+        "Run YubiWatch from a foreground PowerShell window to see the exact error.".to_string(),
+    ]
+}
+
+fn audit_fix_steps(path: &Path) -> Vec<String> {
+    vec![
+        format!("Check that {} is writable.", path.display()),
+        "Create the parent folder or update YUBIWATCH_AUDIT_LOG_FILE in .env.".to_string(),
+        "Run the dashboard again after fixing the path permissions.".to_string(),
+    ]
+}
+
 #[derive(Clone, Debug)]
 struct DashboardStatus {
     key_present: bool,
@@ -637,6 +834,7 @@ struct DashboardStatus {
     yubico_devices: Vec<YubicoDevice>,
     trusted_product_ids: Vec<u16>,
     candidate_product_ids: Vec<u16>,
+    diagnostics: Vec<Diagnostic>,
     message: Option<String>,
 }
 
@@ -648,11 +846,26 @@ fn dashboard_status(context: &DashboardContext, message: Option<&str>) -> Dashbo
     let secure_mode = context
         .mode_controller
         .snapshot(guard_snapshot.enabled, pin_snapshot.is_set);
-    let audit_events = context.audit_log.recent_json_entries(12);
+    let audit_events = match context.audit_log.recent_json_entries_result(12) {
+        Ok(events) => {
+            context.diagnostics.clear_category("audit");
+            events
+        }
+        Err(error) => {
+            context.diagnostics.record(Diagnostic::new(
+                "audit",
+                "Activity history could not be read.",
+                error,
+                audit_fix_steps(&context.config.audit_log_file),
+            ));
+            Vec::new()
+        }
+    };
     let detector =
         NativeYubiKeyDetector::new_with_store(&context.config, context.trusted_products.clone());
     match (detector.connected_devices(), detector.all_yubico_devices()) {
         (Ok(devices), Ok(yubico_devices)) => {
+            context.diagnostics.clear_category("scanner");
             let trusted_product_ids = detector.trusted_product_ids();
             let candidate_product_ids =
                 candidate_product_ids(&yubico_devices, &trusted_product_ids);
@@ -664,6 +877,7 @@ fn dashboard_status(context: &DashboardContext, message: Option<&str>) -> Dashbo
                 .into_iter()
                 .map(|device| device.hardware_id)
                 .collect::<Vec<_>>();
+            let diagnostics = status_diagnostics(context, &secure_mode);
 
             DashboardStatus {
                 key_present: !hardware_ids.is_empty(),
@@ -678,25 +892,64 @@ fn dashboard_status(context: &DashboardContext, message: Option<&str>) -> Dashbo
                 yubico_devices,
                 trusted_product_ids,
                 candidate_product_ids,
+                diagnostics,
                 message: message.map(str::to_string),
             }
         }
-        (Err(error), _) | (_, Err(error)) => DashboardStatus {
-            key_present: false,
-            original_present: false,
-            always_keep_enabled,
-            pin_set: pin_snapshot.is_set,
-            pin_locked_seconds_remaining: pin_snapshot.locked_seconds_remaining,
-            secure_mode,
-            audit_events,
-            error: Some(error),
-            devices: Vec::new(),
-            yubico_devices: Vec::new(),
-            trusted_product_ids: context.trusted_products.product_ids(),
-            candidate_product_ids: Vec::new(),
-            message: message.map(str::to_string),
-        },
+        (Err(error), _) | (_, Err(error)) => {
+            context.diagnostics.record(Diagnostic::new(
+                "scanner",
+                "Security-key scanner failed.",
+                error.clone(),
+                scanner_fix_steps(),
+            ));
+            let diagnostics = status_diagnostics(context, &secure_mode);
+            DashboardStatus {
+                key_present: false,
+                original_present: false,
+                always_keep_enabled,
+                pin_set: pin_snapshot.is_set,
+                pin_locked_seconds_remaining: pin_snapshot.locked_seconds_remaining,
+                secure_mode,
+                audit_events,
+                error: Some(error),
+                devices: Vec::new(),
+                yubico_devices: Vec::new(),
+                trusted_product_ids: context.trusted_products.product_ids(),
+                candidate_product_ids: Vec::new(),
+                diagnostics,
+                message: message.map(str::to_string),
+            }
+        }
     }
+}
+
+fn status_diagnostics(
+    context: &DashboardContext,
+    secure_mode: &SecureModeSnapshot,
+) -> Vec<Diagnostic> {
+    let mut diagnostics = context.diagnostics.entries();
+    let preview_modules = secure_mode
+        .modules
+        .iter()
+        .filter(|module| module.enabled && !module.definition.implemented)
+        .map(|module| module.definition.name)
+        .collect::<Vec<_>>();
+    if !preview_modules.is_empty() {
+        diagnostics.push(Diagnostic::new(
+            "preview",
+            "Some selected protections are preview-only.",
+            format!(
+                "{} do not perform OS blocking in this build.",
+                preview_modules.join(", ")
+            ),
+            vec![
+                "Use the active Security Key Check, Auto Lock, Activity History, and Protection Health modules for enforcement today.".to_string(),
+                "Install a future Windows service or administrator policy backend before relying on preview modules for blocking.".to_string(),
+            ],
+        ));
+    }
+    diagnostics
 }
 
 fn candidate_product_ids(devices: &[YubicoDevice], trusted_product_ids: &[u16]) -> Vec<u16> {
@@ -731,12 +984,17 @@ fn authorize_dashboard_command(
 ) -> Result<(), String> {
     let status = dashboard_status(context, None);
     if let Some(error) = status.error {
-        return Err(json_response(503, &error_json(&error)));
+        return Err(diagnostic_response(
+            context,
+            503,
+            "scanner",
+            "Security-key scanner failed.",
+            &error,
+            scanner_fix_steps(),
+        ));
     }
     if !status.key_present {
-        context
-            .audit_log
-            .record("policy", action, "blocked", "security key absent");
+        record_audit(context, "policy", action, "blocked", "security key absent");
         return Err(json_response(
             409,
             &error_json("Insert your security key before changing protection settings."),
@@ -750,7 +1008,8 @@ fn authorize_dashboard_command(
         ));
     };
     if !context.pin_authorization.verify(&pin_token) {
-        context.audit_log.record(
+        record_audit(
+            context,
             "policy",
             action,
             "blocked",
@@ -1840,8 +2099,22 @@ fn dashboard_html(csrf_token: &str, env_file: &std::path::Path, config: &AppConf
           ...(options.headers || {})
         }
       });
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || "Request failed");
+      const text = await response.text();
+      let data = {};
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (_error) {
+          data = { error: text };
+        }
+      }
+      if (!response.ok) {
+        const steps = Array.isArray(data.fix_steps) && data.fix_steps.length
+          ? ` Fix: ${data.fix_steps.join(" ")}`
+          : "";
+        const cause = data.cause ? ` ${data.cause}` : "";
+        throw new Error(`${data.error || "Request failed"}${cause}${steps}`);
+      }
       return data;
     }
 
@@ -2014,9 +2287,21 @@ fn dashboard_html(csrf_token: &str, env_file: &std::path::Path, config: &AppConf
       }
     }
 
-    function renderWarnings(warnings) {
+    function diagnosticMessage(diagnostic) {
+      if (!diagnostic) return "";
+      const steps = Array.isArray(diagnostic.fix_steps) && diagnostic.fix_steps.length
+        ? ` Fix: ${diagnostic.fix_steps.join(" ")}`
+        : "";
+      const cause = diagnostic.cause ? ` ${diagnostic.cause}` : "";
+      return `${diagnostic.summary || "YubiWatch needs attention."}${cause}${steps}`;
+    }
+
+    function renderWarnings(warnings, diagnostics) {
       nodes.complianceWarnings.textContent = "";
-      const items = warnings && warnings.length ? warnings : ["Nothing needs attention right now."];
+      const items = [];
+      for (const warning of warnings || []) items.push(warning);
+      for (const diagnostic of diagnostics || []) items.push(diagnosticMessage(diagnostic));
+      if (items.length === 0) items.push("Nothing needs attention right now.");
       for (const warning of items) {
         const item = document.createElement("div");
         item.className = "warning-item";
@@ -2243,11 +2528,14 @@ fn dashboard_html(csrf_token: &str, env_file: &std::path::Path, config: &AppConf
       renderDevices(data.devices);
       renderTrusted(data.trusted_product_ids);
       renderCandidates(data);
-      renderWarnings(secure.warnings);
+      renderWarnings(secure.warnings, data.diagnostics);
       renderModules(data, proofActive || commandLocked);
       renderAudit(data.audit_events);
 
-      nodes.message.textContent = data.error
+      const firstDiagnostic = (data.diagnostics || [])[0];
+      nodes.message.textContent = firstDiagnostic
+        ? diagnosticMessage(firstDiagnostic)
+        : data.error
         ? `Security-key scanner error: ${data.error}`
         : proofActive
           ? "Complete the key interaction before the timer expires."
@@ -2491,7 +2779,7 @@ fn dashboard_status_json(status: &DashboardStatus, snapshot: &GuardSnapshot) -> 
     let base = snapshot_json(snapshot, Some(status.key_present), status.error.as_deref());
     let payload = base.trim_end_matches('}').to_string()
         + &format!(
-            ",\"original_present\":{},\"always_keep_enabled\":{},\"pin_set\":{},\"pin_locked_seconds_remaining\":{},\"secure_mode\":{},\"audit_events\":[{}],\"trusted_product_ids\":[{}],\"candidate_product_ids\":[{}],\"yubico_devices\":[{}],\"message\":{}}}",
+            ",\"original_present\":{},\"always_keep_enabled\":{},\"pin_set\":{},\"pin_locked_seconds_remaining\":{},\"secure_mode\":{},\"audit_events\":[{}],\"trusted_product_ids\":[{}],\"candidate_product_ids\":[{}],\"yubico_devices\":[{}],\"diagnostics\":[{}],\"message\":{}}}",
             status.original_present,
             status.always_keep_enabled,
             status.pin_set,
@@ -2504,6 +2792,7 @@ fn dashboard_status_json(status: &DashboardStatus, snapshot: &GuardSnapshot) -> 
             product_id_list_json(&status.trusted_product_ids),
             product_id_list_json(&status.candidate_product_ids),
             yubico_devices_json(&status.yubico_devices),
+            diagnostics_json(&status.diagnostics),
             status
                 .message
                 .as_ref()
@@ -2518,7 +2807,16 @@ fn dashboard_status_json(status: &DashboardStatus, snapshot: &GuardSnapshot) -> 
 }
 
 fn error_json(error: &str) -> String {
-    format!("{{\"error\":\"{}\"}}", escape_json(error))
+    diagnostic_error_json(error, "", &[])
+}
+
+fn diagnostic_error_json(error: &str, cause: &str, fix_steps: &[String]) -> String {
+    format!(
+        "{{\"error\":\"{}\",\"cause\":\"{}\",\"fix_steps\":[{}]}}",
+        escape_json(error),
+        escape_json(cause),
+        quoted_list_json(fix_steps)
+    )
 }
 
 fn pin_confirm_json(token: &str, expires_in_seconds: u64, message: &str) -> String {
@@ -2567,16 +2865,28 @@ fn yubico_devices_json(devices: &[YubicoDevice]) -> String {
         .join(",")
 }
 
+fn diagnostics_json(diagnostics: &[Diagnostic]) -> String {
+    diagnostics
+        .iter()
+        .map(|diagnostic| {
+            format!(
+                "{{\"category\":\"{}\",\"summary\":\"{}\",\"cause\":\"{}\",\"fix_steps\":[{}]}}",
+                escape_json(&diagnostic.category),
+                escape_json(&diagnostic.summary),
+                escape_json(&diagnostic.cause),
+                quoted_list_json(&diagnostic.fix_steps)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn html_response(body: &str) -> String {
     response(200, "text/html; charset=utf-8", body)
 }
 
 fn json_response(status: u16, body: &str) -> String {
     response(status, "application/json; charset=utf-8", body)
-}
-
-fn plain_response(status: u16, body: &str) -> String {
-    response(status, "text/plain; charset=utf-8", body)
 }
 
 fn response(status: u16, content_type: &str, body: &str) -> String {
@@ -3053,6 +3363,7 @@ mod tests {
             yubico_devices: Vec::new(),
             trusted_product_ids: vec![0x0402],
             candidate_product_ids: Vec::new(),
+            diagnostics: Vec::new(),
             message: None,
         };
 
@@ -3070,6 +3381,7 @@ mod tests {
         assert!(json.contains("\"pin_set\":true"));
         assert!(json.contains("\"secure_mode\""));
         assert!(json.contains("\"audit_events\""));
+        assert!(json.contains("\"diagnostics\""));
         assert!(json.contains("\"trusted_product_ids\":[\"0x0402\"]"));
     }
 

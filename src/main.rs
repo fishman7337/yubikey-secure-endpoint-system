@@ -8,6 +8,8 @@ use yubiwatch_native::browser::open_url;
 use yubiwatch_native::config::{AppConfig, default_env_path};
 use yubiwatch_native::dashboard::spawn_dashboard;
 use yubiwatch_native::detector::{NativeYubiKeyDetector, TrustedProducts};
+use yubiwatch_native::diagnostics::RuntimeDiagnostics;
+use yubiwatch_native::instance::{InstanceError, InstanceGuard};
 use yubiwatch_native::locker::WorkstationLocker;
 use yubiwatch_native::mode::module_default_enabled;
 use yubiwatch_native::security::SecurityGate;
@@ -43,6 +45,25 @@ fn run(args: Args) -> ! {
         process::exit(check_once(&config));
     }
 
+    let _instance_guard = match InstanceGuard::acquire_for_env_file(&args.env_file) {
+        Ok(guard) => guard,
+        Err(InstanceError::AlreadyRunning) => {
+            println!(
+                "YubiWatch is already running for {}. Reuse the existing dashboard instead of starting another copy.",
+                args.env_file.display()
+            );
+            process::exit(0);
+        }
+        Err(InstanceError::System(error)) => {
+            eprintln!("Could not create the YubiWatch single-instance guard: {error}");
+            eprintln!(
+                "Fix: restart Windows, then run `yubiwatch.exe --env-file {} --foreground --dry-run`. If this repeats, check Windows permissions for named mutex creation.",
+                args.env_file.display()
+            );
+            process::exit(2);
+        }
+    };
+
     let identity_enabled = config
         .module_overrides
         .get("identity_access")
@@ -55,6 +76,7 @@ fn run(args: Args) -> ! {
         config.disable_proof_timeout,
     );
     let trusted_products = TrustedProducts::new(config.product_ids.clone());
+    let diagnostics = RuntimeDiagnostics::new();
     let dashboard_enabled = args
         .dashboard_override
         .unwrap_or(config.dashboard_enabled && !args.dry_run);
@@ -66,6 +88,7 @@ fn run(args: Args) -> ! {
             args.env_file.clone(),
             gate.clone(),
             trusted_products.clone(),
+            diagnostics.clone(),
             !args.dry_run,
         ) {
             Ok(_handle) => {
@@ -73,26 +96,37 @@ fn run(args: Args) -> ! {
                     println!("Dashboard listening on {dashboard_url}");
                 }
 
-                let should_open_dashboard = args.open_dashboard_override.unwrap_or(
-                    config.open_dashboard_on_startup && !args.dry_run && !startup_browser_handled,
-                );
-                if should_open_dashboard {
+                if should_open_dashboard(&args, &config, startup_browser_handled) {
                     match open_url(&dashboard_url) {
                         Ok(()) if args.foreground => {
                             println!("Opened dashboard in the default browser.");
                         }
                         Ok(()) => {}
-                        Err(error) => eprintln!("{error}"),
+                        Err(error) => {
+                            eprintln!("{error}");
+                            eprintln!(
+                                "Fix: open {dashboard_url} manually, or set YUBIWATCH_OPEN_DASHBOARD_ON_STARTUP=false in {} to keep startup headless.",
+                                args.env_file.display()
+                            );
+                        }
                     }
                 }
             }
-            Err(error) => eprintln!("{error}"),
+            Err(error) => {
+                eprintln!("{error}");
+                eprintln!(
+                    "Fix: close the program using port {}, change YUBIWATCH_DASHBOARD_PORT in {}, or run with --no-dashboard while troubleshooting.",
+                    config.dashboard_port,
+                    args.env_file.display()
+                );
+            }
         }
     }
 
     let detector = NativeYubiKeyDetector::new_with_store(&config, trusted_products);
     let locker = WorkstationLocker::new(!args.dry_run);
-    let mut watchdog = Watchdog::new(config, detector, locker, gate, args.foreground);
+    let mut watchdog = Watchdog::new(config, detector, locker, gate, args.foreground)
+        .with_diagnostics(diagnostics);
     watchdog.run_forever();
 }
 
@@ -101,6 +135,9 @@ fn check_once(config: &AppConfig) -> i32 {
     match detector.connected_devices() {
         Ok(devices) if devices.is_empty() => {
             println!("No matching security key detected.");
+            println!(
+                "Fix: insert the configured key, verify YUBIWATCH_VENDOR_ID and YUBIWATCH_PRODUCT_IDS in .env, and confirm the key appears in Windows Device Manager."
+            );
             1
         }
         Ok(devices) => {
@@ -112,9 +149,17 @@ fn check_once(config: &AppConfig) -> i32 {
         }
         Err(error) => {
             eprintln!("USB detection failed: {error}");
+            eprintln!(
+                "Fix: run again with --foreground --dry-run, verify the key in Device Manager, and check the configured YUBIWATCH_VENDOR_ID/YUBIWATCH_PRODUCT_IDS values."
+            );
             2
         }
     }
+}
+
+fn should_open_dashboard(args: &Args, config: &AppConfig, startup_browser_handled: bool) -> bool {
+    args.open_dashboard_override
+        .unwrap_or(config.open_dashboard_on_startup && !args.dry_run && !startup_browser_handled)
 }
 
 fn parse_args(args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
@@ -177,4 +222,53 @@ Options:
   -h, --help       Show this help.
 "
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args() -> Args {
+        Args {
+            env_file: PathBuf::from(".env"),
+            check: false,
+            foreground: false,
+            dry_run: false,
+            dashboard_override: None,
+            open_dashboard_override: None,
+        }
+    }
+
+    #[test]
+    fn dashboard_open_decision_respects_startup_config() {
+        let mut config = AppConfig {
+            open_dashboard_on_startup: true,
+            ..AppConfig::default()
+        };
+
+        assert!(should_open_dashboard(&args(), &config, false));
+        assert!(!should_open_dashboard(&args(), &config, true));
+
+        config.open_dashboard_on_startup = false;
+        assert!(!should_open_dashboard(&args(), &config, false));
+    }
+
+    #[test]
+    fn dashboard_open_decision_respects_dry_run_and_overrides() {
+        let config = AppConfig {
+            open_dashboard_on_startup: true,
+            ..AppConfig::default()
+        };
+        let mut parsed = args();
+
+        parsed.dry_run = true;
+        assert!(!should_open_dashboard(&parsed, &config, false));
+
+        parsed.open_dashboard_override = Some(true);
+        assert!(should_open_dashboard(&parsed, &config, false));
+
+        parsed.dry_run = false;
+        parsed.open_dashboard_override = Some(false);
+        assert!(!should_open_dashboard(&parsed, &config, false));
+    }
 }

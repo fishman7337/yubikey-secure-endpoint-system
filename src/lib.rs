@@ -9,6 +9,8 @@ pub mod browser;
 pub mod config;
 pub mod dashboard;
 pub mod detector;
+pub mod diagnostics;
+pub mod instance;
 pub mod locker;
 pub mod mode;
 pub mod pin;

@@ -4,6 +4,11 @@ setlocal
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
 
+if exist "%SCRIPT_DIR%.dist\yubiwatch-current.exe" (
+    "%SCRIPT_DIR%.dist\yubiwatch-current.exe" --env-file "%SCRIPT_DIR%.env"
+    exit /b %ERRORLEVEL%
+)
+
 if exist "%SCRIPT_DIR%.dist\yubiwatch-latest.exe" (
     "%SCRIPT_DIR%.dist\yubiwatch-latest.exe" --env-file "%SCRIPT_DIR%.env"
     exit /b %ERRORLEVEL%

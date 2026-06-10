@@ -5,7 +5,9 @@
 The repository includes `.github/workflows/ci.yml`. It runs on
 `windows-latest` for pushes and pull requests to `main`, and can also be
 started manually from GitHub Actions. The workflow checks Rust formatting,
-Rust tests, clippy, Python tests, and Playwright dashboard E2E tests.
+Rust tests, clippy, Python tests, and Playwright dashboard E2E tests. It runs
+the Python tests once before installing `requirements.txt`, then installs PyUSB
+and runs them again.
 
 ## Rust Tests
 
@@ -33,6 +35,8 @@ These tests cover:
 - relock cooldown behavior
 - state reset after key reinsertion
 - fail-safe behavior when USB detection fails
+- native single-instance guard behavior
+- dashboard auto-open decision logic
 
 ## Rust Manual Checks
 
@@ -91,8 +95,22 @@ The Python implementation remains testable:
 python -m unittest discover -s tests
 ```
 
-The Python tests cover equivalent policy behavior and PyUSB filtering.
+The Python tests cover equivalent policy behavior, PyUSB filtering, missing
+PyUSB import handling, backend-error wrapping, and startup-script expectations.
+They pass before PyUSB is installed because detector tests mock the USB module
+instead of requiring a real PyUSB package. Live Python fallback use still needs
+`requirements.txt` and a working USB backend.
+
+To mirror CI locally:
+
+```powershell
+python -m unittest discover -s tests -v
+python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
 
 ## What Is Not Automated
 
-The tests do not call the real Windows lock action. Live locking should be checked manually only after `--check` and `--dry-run` behave correctly.
+The tests do not call the real Windows lock action, register the scheduled task,
+or enumerate live USB hardware without mocks. Live locking should be checked
+manually only after `--check` and `--dry-run` behave correctly.
