@@ -6,6 +6,15 @@ YubiWatch is a Windows laptop-protection app that locks the laptop when the conf
 
 The primary implementation is now the native Rust executable at `target\release\yubiwatch.exe`. The Python version remains in the repo as a readable reference and fallback during migration.
 
+## Evidence and interpretation
+
+| Evidence-backed measure | Current repository evidence |
+| --- | --- |
+| Implemented control loop | A user-mode YubiKey presence watchdog can trigger Windows locking and PIN-gated local controls with audit logging. |
+| Technology surface | Rust, Python, and web assets support the watchdog, dashboard, packaging, and reversible control modules. |
+
+The qualitative outcome is a local, fail-safe endpoint-control prototype. Network, application, data, clipboard, privilege, deep-tamper, and service-backed protections remain preview designs; the repository does not claim comprehensive endpoint compliance or tamper resistance.
+
 ## Why Rust
 
 - Native executable with no interpreter, virtual environment, or Python background process.

@@ -49,7 +49,9 @@ class ConfigTests(unittest.TestCase):
             env_file = Path(temp_dir) / ".env"
             env_file.write_text("YUBIWATCH_PRODUCT_IDS=0x0402", encoding="utf-8")
 
-            with patch.dict(os.environ, {"YUBIWATCH_PRODUCT_IDS": "0x0407"}, clear=True):
+            with patch.dict(
+                os.environ, {"YUBIWATCH_PRODUCT_IDS": "0x0407"}, clear=True
+            ):
                 config = load_config(env_file)
 
         self.assertEqual(config.product_ids, (0x0407,))

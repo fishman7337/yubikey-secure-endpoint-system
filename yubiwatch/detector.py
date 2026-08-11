@@ -70,7 +70,8 @@ class YubiKeyDetector:
         """
         if USB_IMPORT_ERROR is not None:
             raise UsbDetectionError(
-                "PyUSB is not installed. Install dependencies with: pip install -r requirements.txt"
+                "PyUSB is not installed. Install dependencies with: "
+                "pip install -r requirements.txt"
             ) from USB_IMPORT_ERROR
 
         try:

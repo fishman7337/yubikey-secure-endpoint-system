@@ -10,7 +10,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
 DEFAULT_LOCAL_LIBUSB = PROJECT_ROOT / "libusb-1.0.dll"
