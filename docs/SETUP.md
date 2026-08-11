@@ -1,17 +1,17 @@
 # Setup Notes
 
-Run commands from:
-
-```powershell
-C:\Users\kunmi\Downloads\YubiWatch
-```
+Run commands from the repository root.
 
 ## Rust Toolchain
+
+The repository pins Rust 1.95.0, with Clippy and rustfmt, in
+`rust-toolchain.toml`. Rustup-aware commands automatically select that toolchain
+so local and CI checks use the same compiler release.
 
 Rust is installed at:
 
 ```powershell
-C:\Users\kunmi\.cargo\bin
+$env:USERPROFILE\.cargo\bin
 ```
 
 If `cargo` is not recognized in a new shell, add it for the current session:

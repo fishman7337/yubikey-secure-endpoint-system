@@ -2,6 +2,7 @@
 name = "yubiwatch-native"
 version = "1.0.0"
 edition = "2024"
+rust-version = "1.95"
 description = "Native Windows watchdog that locks the workstation when the configured YubiKey is absent."
 license = "MIT"
 
