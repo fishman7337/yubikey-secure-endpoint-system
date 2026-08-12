@@ -73,7 +73,10 @@ class YubiWatchdog:
         present = self._is_yubikey_present()
 
         if present:
-            if self.state.missing_since is not None or self.state.last_lock_at is not None:
+            if (
+                self.state.missing_since is not None
+                or self.state.last_lock_at is not None
+            ):
                 self.logger.info("YubiKey detected. Monitoring resumed.")
             self.state = WatchdogState()
             return self.config.present_poll_seconds
@@ -83,12 +86,9 @@ class YubiWatchdog:
             self.logger.warning("YubiKey not detected. Starting grace timer.")
 
         missing_for = now - self.state.missing_since
-        if (
-            missing_for >= self.config.missing_grace_seconds
-            and (
-                self.state.last_lock_at is None
-                or now - self.state.last_lock_at >= self.config.relock_seconds
-            )
+        if missing_for >= self.config.missing_grace_seconds and (
+            self.state.last_lock_at is None
+            or now - self.state.last_lock_at >= self.config.relock_seconds
         ):
             self._lock_workstation()
             self.state.last_lock_at = now

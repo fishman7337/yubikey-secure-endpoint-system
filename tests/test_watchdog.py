@@ -52,7 +52,9 @@ class WatchdogTests(unittest.TestCase):
     def test_missing_key_waits_for_grace_period_before_locking(self) -> None:
         config = make_config(missing_grace_seconds=2.0)
         locker = FakeLocker()
-        watchdog = YubiWatchdog(config, FakeDetector([False, False]), locker, make_logger())
+        watchdog = YubiWatchdog(
+            config, FakeDetector([False, False]), locker, make_logger()
+        )
 
         self.assertEqual(watchdog.tick(now=10.0), config.missing_poll_seconds)
         self.assertEqual(locker.lock_count, 0)
@@ -63,7 +65,9 @@ class WatchdogTests(unittest.TestCase):
     def test_absent_key_relocks_after_cooldown(self) -> None:
         config = make_config(missing_grace_seconds=0.0, relock_seconds=5.0)
         locker = FakeLocker()
-        watchdog = YubiWatchdog(config, FakeDetector([False, False, False]), locker, make_logger())
+        watchdog = YubiWatchdog(
+            config, FakeDetector([False, False, False]), locker, make_logger()
+        )
 
         watchdog.tick(now=10.0)
         watchdog.tick(now=14.0)
@@ -74,7 +78,9 @@ class WatchdogTests(unittest.TestCase):
     def test_reinserted_key_resets_absence_state(self) -> None:
         config = make_config(missing_grace_seconds=0.0)
         locker = FakeLocker()
-        watchdog = YubiWatchdog(config, FakeDetector([False, True]), locker, make_logger())
+        watchdog = YubiWatchdog(
+            config, FakeDetector([False, True]), locker, make_logger()
+        )
 
         watchdog.tick(now=10.0)
         sleep_for = watchdog.tick(now=11.0)
