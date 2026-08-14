@@ -104,6 +104,35 @@ class WatchdogTests(unittest.TestCase):
 
         self.assertEqual(locker.lock_count, 1)
 
+    def test_detection_error_does_not_lock_when_fail_safe_disabled(self) -> None:
+        config = make_config(fail_safe_lock=False)
+        locker = FakeLocker()
+        watchdog = YubiWatchdog(
+            config,
+            FakeDetector([UsbDetectionError("backend unavailable")]),
+            locker,
+            make_logger(),
+        )
+
+        sleep_for = watchdog.tick(now=10.0)
+
+        self.assertEqual(sleep_for, config.present_poll_seconds)
+        self.assertEqual(locker.lock_count, 0)
+        self.assertIsNone(watchdog.state.missing_since)
+        self.assertIsNone(watchdog.state.last_lock_at)
+
+    def test_lock_disabled_skips_lock_call_but_records_lock_attempt(self) -> None:
+        config = make_config(missing_grace_seconds=0.0, lock_enabled=False)
+        locker = FakeLocker()
+        watchdog = YubiWatchdog(config, FakeDetector([False]), locker, make_logger())
+
+        sleep_for = watchdog.tick(now=10.0)
+
+        self.assertEqual(sleep_for, config.post_lock_poll_seconds)
+        self.assertEqual(locker.lock_count, 0)
+        self.assertEqual(watchdog.state.missing_since, 10.0)
+        self.assertEqual(watchdog.state.last_lock_at, 10.0)
+
 
 if __name__ == "__main__":
     unittest.main()

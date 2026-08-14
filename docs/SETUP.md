@@ -53,9 +53,9 @@ http://127.0.0.1:8765/
 ```
 
 This laptop's `.env` sets `YUBIWATCH_OPEN_DASHBOARD_ON_STARTUP=true`, so the
-startup launcher opens that local control panel in the default browser after
-logon. Set it to `false` if you want the watchdog to run quietly in the
-background.
+native watchdog opens that local control panel in the default browser after
+logon. The VBS launcher only starts the hidden watchdog process. Set the value
+to `false` if you want the watchdog to run quietly in the background.
 
 Protection starts off unless `YUBIWATCH_ALWAYS_KEEP_ENABLED=true`. On first
 use, insert the configured security key and set the Security PIN. After that,
@@ -68,11 +68,16 @@ The existing VBS and batch launcher can stay. `start_watchdog.bat` now starts
 the side-by-side Rust binary in `.dist` when it exists, then falls back to
 `target\release\yubiwatch.exe`.
 
-Install or refresh the scheduled task:
+Install or refresh the logon scheduled task:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_task.ps1
 ```
+
+The scheduled task uses only an `AtLogOn` trigger for the current Windows user.
+It does not install boot, unlock, or session-change triggers. It also sets
+`MultipleInstances IgnoreNew`, and the native watchdog has its own per-`.env`
+single-instance guard for manual launches.
 
 If Windows denies scheduled-task registration, the installer falls back to a
 per-user Startup folder shortcut:
@@ -81,9 +86,20 @@ per-user Startup folder shortcut:
 %APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\YubiWatch.lnk
 ```
 
+That shortcut is fallback-only. If the scheduled task installs successfully,
+`install_task.ps1` removes the shortcut so there is one startup path.
+
 ## Python Fallback
 
-The Python implementation is optional now:
+The Python implementation is optional now. Unit tests pass without PyUSB
+installed because they mock USB detection and separately verify the missing
+PyUSB error path:
+
+```powershell
+py -3 -m unittest discover -s tests -v
+```
+
+Install dependencies only for live Python fallback use:
 
 ```powershell
 py -3 -m venv .venv

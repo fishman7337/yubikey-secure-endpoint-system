@@ -125,7 +125,26 @@ test('status API exposes trusted-device dashboard fields', async ({ request }) =
   expect(payload).toHaveProperty('audit_events');
   expect(payload).toHaveProperty('trusted_product_ids');
   expect(payload).toHaveProperty('candidate_product_ids');
+  expect(payload).toHaveProperty('diagnostics');
   expect(payload.trusted_product_ids).toContain('0x0402');
+});
+
+test('second watchdog exits instead of starting a duplicate instance', async ({}, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'process singleton is covered once');
+
+  const second = spawn(
+    EXE,
+    ['--env-file', ENV_FILE, '--dry-run', '--dashboard', '--foreground'],
+    {
+      cwd: ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: withCargoPath(process.env)
+    }
+  );
+  const result = await waitForProcess(second, 5_000);
+
+  expect(result.code).toBe(0);
+  expect(`${result.stdout}\n${result.stderr}`).toContain('YubiWatch is already running');
 });
 
 test('command endpoints require a matching key to be inserted', async ({ request }) => {
@@ -212,6 +231,7 @@ test('confirmed security PIN unlocks changes for one minute', async ({ page }) =
     trusted_product_ids: ['0x0402'],
     candidate_product_ids: [],
     yubico_devices: [],
+    diagnostics: [],
     message: null
   };
   let enableBody;
@@ -319,4 +339,30 @@ async function dashboardToken(request) {
     throw new Error('dashboard token not found');
   }
   return match[1];
+}
+
+async function waitForProcess(child, timeoutMs) {
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk.toString();
+  });
+  child.stderr.on('data', (chunk) => {
+    stderr += chunk.toString();
+  });
+
+  return await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`process did not exit within ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer);
+      resolve({ code, signal, stdout, stderr });
+    });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
 }
